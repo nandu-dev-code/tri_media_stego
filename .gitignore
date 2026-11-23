@@ -1,0 +1,28 @@
+# Python environment
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Stego storage & temporary uploads
+uploads/*
+!uploads/.gitkeep
+stego_store/*
+!stego_store/.gitkeep
+uploads.zip
+
+# Database & Environment
+*.db
+*.sqlite
+*.sqlite3
+instance/
+.env
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
