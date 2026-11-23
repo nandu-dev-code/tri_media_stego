@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 # For image/audio/video helpers
 from PIL import Image
 import soundfile as sf
+import numpy as np
+import shutil
 
 # Load environment variables if .env file exists
 try:
@@ -45,6 +47,7 @@ app.config.update(
     SECRET_KEY=SECRET_KEY,
     SQLALCHEMY_DATABASE_URI=DB_URI,
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    MAX_CONTENT_LENGTH=32 * 1024 * 1024,  # Cap file uploads to 32MB to prevent memory exhaustion
 )
 
 db = SQLAlchemy(app)
@@ -129,34 +132,48 @@ def _bits2bytes(bits):
     return bytes(out)
 
 # -----------------------
-# IMAGE embed/extract (existing LSB functions kept)
+# IMAGE embed/extract (Memory-optimized NumPy vectorized)
 # -----------------------
 def img_embed(cover_path, payload: bytes, out_path):
-    img = Image.open(cover_path).convert("RGB")
-    px = list(img.getdata()); flat=[]
-    for r,g,b in px: flat += [r,g,b]
-    need = 32 + len(payload)*8
-    if need > len(flat): raise ValueError("payload too large for this image")
+    with Image.open(cover_path) as img:
+        img_rgb = img.convert("RGB")
+        max_dim = 2048
+        if img_rgb.width > max_dim or img_rgb.height > max_dim:
+            img_rgb.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        arr = np.array(img_rgb, dtype=np.uint8)
+
+    total_bytes = arr.size
+    need = 32 + len(payload) * 8
+    if need > total_bytes:
+        raise ValueError("payload too large for this image")
+
     L = len(payload)
-    header = [(L>>i)&1 for i in range(31,-1,-1)]
-    bits = header + list(_bits(payload))
-    for i,b in enumerate(bits): flat[i] = (flat[i] & 0xFE) | b
-    new = [(flat[i],flat[i+1],flat[i+2]) for i in range(0,len(flat),3)]
-    out = Image.new("RGB", img.size); out.putdata(new); out.save(out_path, "PNG")
+    header = [(L >> i) & 1 for i in range(31, -1, -1)]
+    bits = np.array(header + list(_bits(payload)), dtype=np.uint8)
+
+    # In-place LSB modification on flat array view (avoids allocating millions of Python objects)
+    flat = arr.reshape(-1)
+    flat[:len(bits)] = (flat[:len(bits)] & 0xFE) | bits
+
+    out = Image.fromarray(arr, "RGB")
+    out.save(out_path, "PNG")
 
 def img_extract(stego_path) -> bytes:
-    img = Image.open(stego_path).convert("RGB")
-    flat=[]; 
-    for r,g,b in img.getdata(): flat += [r,g,b]
-    L=0
-    for i in range(32): L=(L<<1)|(flat[i]&1)
-    bits=[flat[32+i]&1 for i in range(L*8)]
-    return _bits2bytes(bits)
+    with Image.open(stego_path) as img:
+        arr = np.array(img.convert("RGB"), dtype=np.uint8)
+    flat = arr.reshape(-1)
+    # Read length from first 32 bits
+    L = 0
+    for b in (flat[:32] & 1):
+        L = (L << 1) | int(b)
+    if 32 + L * 8 > flat.size:
+        raise ValueError("corrupt stego header or payload too large")
+    payload_bits = flat[32 : 32 + L * 8] & 1
+    return _bits2bytes(payload_bits)
 
 # -----------------------
 # AUDIO embed/extract (existing)
 # -----------------------
-import soundfile as sf
 def audio_embed_wav(cover_wav, payload: bytes, out_wav):
     data, sr = sf.read(cover_wav, dtype='int16')
     mono = data[:,0] if data.ndim==2 else data
@@ -180,23 +197,37 @@ def audio_extract_wav(stego_wav) -> bytes:
     return _bits2bytes(bits)
 
 # -----------------------
-# VIDEO embed/extract (existing trailer approach)
+# VIDEO embed/extract (Streaming trailer approach - zero memory spike)
 # -----------------------
-V_MAGIC=b"VSTEGO1"
+V_MAGIC = b"VSTEGO1"
 def video_embed_trailer(cover_path, payload: bytes, out_path):
-    with open(cover_path,'rb') as f: content=f.read()
-    trailer = V_MAGIC + len(payload).to_bytes(4,'big') + payload
-    with open(out_path,'wb') as f:
-        f.write(content); f.write(trailer)
+    # Stream copy without loading entire video into RAM
+    shutil.copyfile(cover_path, out_path)
+    trailer = V_MAGIC + len(payload).to_bytes(4, 'big') + payload
+    with open(out_path, 'ab') as f:
+        f.write(trailer)
 
 def video_extract_trailer(stego_path) -> bytes:
-    with open(stego_path,'rb') as f: data=f.read()
+    file_size = os.path.getsize(stego_path)
+    # Only read the trailing chunk (max 10MB) where payload was appended
+    chunk_size = min(file_size, 10 * 1024 * 1024)
+    with open(stego_path, 'rb') as f:
+        f.seek(file_size - chunk_size)
+        data = f.read(chunk_size)
     i = data.rfind(V_MAGIC)
-    if i == -1: raise ValueError("no payload")
+    if i == -1:
+        # Fallback to reading full file if trailer was prior to last 10MB
+        with open(stego_path, 'rb') as f:
+            data = f.read()
+        i = data.rfind(V_MAGIC)
+        if i == -1:
+            raise ValueError("no payload")
     i += len(V_MAGIC)
-    L = int.from_bytes(data[i:i+4], 'big'); i += 4
+    L = int.from_bytes(data[i:i+4], 'big')
+    i += 4
     payload = data[i:i+L]
-    if len(payload) != L: raise ValueError("corrupt payload")
+    if len(payload) != L:
+        raise ValueError("corrupt payload")
     return payload
 
 # -----------------------
