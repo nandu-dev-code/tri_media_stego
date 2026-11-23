@@ -1,5 +1,7 @@
 # Tri-Media Steganography Platform 🔐
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/nandu-dev-code/tri_media_stego)
+
 A secure web application for concealing encrypted messages inside multimedia carrier files (**Images**, **Audio**, and **Video**) using authenticated cryptography and steganographic embedding with user authentication and QR + OTP verification.
 
 ---
